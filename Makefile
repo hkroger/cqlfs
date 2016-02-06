@@ -1,5 +1,17 @@
-cqlfs: cqlfs.c
-	gcc cqlfs.c  -lcassandra -losxfuse -I/usr/local/include/osxfuse/fuse -o cqlfs -Werror
+CC=gcc 
+CPPFLAGS=-Wall -Werror
+INCLUDES=-I/usr/local/include/osxfuse/fuse 
+OBJS=$(patsubst %.c,%.o,$(wildcard *.c))
+LDLIBS=-lcassandra -losxfuse
+DEPS=*.h
 
-cassandratest: cassandratest.c
-	gcc cassandratest.c  -lcassandra -o cassandratest 
+cqlfs: $(OBJS)
+	$(CC) $(OBJS) $(LDLIBS)  -o cqlfs 
+
+%.o: %.c $(DEPS)
+	$(CC) $(INCLUDES) $(CFLAGS) $(CPPFLAGS) -c -o $@ $<
+
+.PHONY : clean
+clean :
+	rm $(OBJS)
+	rm cqlfs
