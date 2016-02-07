@@ -144,6 +144,27 @@ CassFuture* CassandraFS::sub_entries(const char* path, int limit) {
     return result_future;
 }
 
+int CassandraFS::update_timestamps(const char* path, const struct timespec last_access_stamp, const struct timespec last_modification_stamp) {
+    CassStatement* statement = cass_statement_new("UPDATE entries SET modified_at = ? WHERE path = ?", 2);
+    cass_statement_bind_int64(statement, 0, last_modification_stamp.tv_sec * 1000 + (last_modification_stamp.tv_nsec / 1000000));
+    cass_statement_bind_string(statement, 1, path);
+
+    CassFuture* result_future = cass_session_execute(ctxt->session, statement);
+    cass_statement_free(statement);
+    int error = 0;
+
+    if (cass_future_error_code(result_future) == CASS_OK) {
+        // Nada
+    } else {
+        /* Handle error */
+        error = -EIO;
+        cassandra_log_error(result_future);
+    }
+    cass_future_free(result_future);
+        
+    return error;
+}
+
 int CassandraFS::update_mode(const char* path, mode_t new_mode) {
     CassStatement* statement = cass_statement_new("UPDATE entries SET mode = ? WHERE path = ?", 2);
     cass_statement_bind_int32(statement, 0, new_mode);
@@ -364,6 +385,8 @@ int CassandraFS::update_block(CassUuid* physical_file_id,
     struct stat* stat,
     struct cfs_attrs* cfs_attrs) {
 
+    debug("Updating block %d (offset: %d) with %d bytes", block, block_offset, bytes_to_write);
+
     // If no need to update existing block
     if (block * cfs_attrs->block_size >= stat->st_size) {
 		write_block(physical_file_id, block, buf, bytes_to_write);
@@ -376,7 +399,7 @@ int CassandraFS::update_block(CassUuid* physical_file_id,
 
 		memcpy(data + block_offset, buf, bytes_to_write);
 
-		write_block(physical_file_id, block, data, length);
+		write_block(physical_file_id, block, data, block_offset + bytes_to_write);
 
 		free(data);
     }

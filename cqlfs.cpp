@@ -181,7 +181,7 @@ int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struc
     int current_block_offset = offset % cfs.block_size;
     long bytes_read = 0;
 
-    while (bytes_read < size && offset + bytes_read < stat.st_size) {
+    while (bytes_read < size && offset + bytes_read < stat.st_size && current_block * cfs.block_size < stat.st_size) {
         int length = 0;
         unsigned char* data = cassandraFS->read_block(&(cfs.physical_file_id), current_block, &length);
         int bytes_to_be_copied = min(length-current_block_offset, size-bytes_read);
@@ -245,8 +245,7 @@ int cql_removexattr(const char *path, const char *name) {
 int cql_utimens(const char* path, const struct timespec ts[]) {
     debug("utimens: %s", path);
 
-    // TODO: actually update stuff
-    return 0;
+    return cassandraFS->update_timestamps(path, ts[0], ts[1]);
 }
 
 int cql_bmap(const char* path, size_t blocksize, uint64_t* blockno) {

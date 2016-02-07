@@ -37,6 +37,7 @@ public:
     unsigned char* read_block(CassUuid* physical_file_id, int block, int* bytes_read);
     void write_block(CassUuid* physical_file_id, int block, const unsigned char* data, int length);
     int update_mode(const char* path, mode_t new_mode);
+    int update_timestamps(const char* path, const struct timespec last_access_stamp, const struct timespec last_modification_stamp);
     
     CassFuture* remove_entry(const char* path);
     CassFuture* remove_sub_entry(const char* path);
