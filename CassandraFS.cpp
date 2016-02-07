@@ -17,13 +17,28 @@ CassError CassandraFS::create_file(const char* path, mode_t mode) {
     cass_uuid_gen_time(ctxt->uuid_gen, &uuid);
     CassError error_value = CASS_OK;
 
-    CassFuture* result_future = create_entry(path, &uuid, mode);
+    CassFuture* result_future = NULL;
+
+    if (S_ISDIR(mode)) {
+        result_future = create_dir_entry(path, mode);
+    } else {
+        result_future = create_file_entry(path, &uuid, mode);
+    }
+    
     CassFuture* result_future2 = create_sub_entry(path);
-    CassFuture* result_future3 = create_physical_file(&uuid);
+    CassFuture* result_future3 = NULL;
+
+    if (!S_ISDIR(mode)) {
+        result_future3 = create_physical_file(&uuid);
+    }
 
     CassError err1 = cass_future_error_code(result_future);
     CassError err2 = cass_future_error_code(result_future2);
-    CassError err3 = cass_future_error_code(result_future3);
+    CassError err3 = CASS_OK; 
+
+    if (result_future3 != NULL) {
+        err3 = cass_future_error_code(result_future3);
+    }
 
     if (err1 != CASS_OK) {
         cassandra_log_error(result_future);
@@ -35,20 +50,22 @@ CassError CassandraFS::create_file(const char* path, mode_t mode) {
         error_value = err2;
     }
 
-    if (err3 != CASS_OK) {
+    if (err3 != CASS_OK && result_future3 != NULL) {
         cassandra_log_error(result_future3);
         error_value = err3;
     }
 
     cass_future_free(result_future);
     cass_future_free(result_future2);
-    cass_future_free(result_future3);
+    if (result_future3 != NULL) {
+        cass_future_free(result_future3);
+    }
 
     return error_value;
 
 }
 
-CassFuture* CassandraFS::create_entry(const char* path, CassUuid* uuid, mode_t mode) {
+CassFuture* CassandraFS::create_file_entry(const char* path, CassUuid* uuid, mode_t mode) {
     CassStatement* statement = cass_statement_new("INSERT INTO entries(path, mode, created_at, modified_at, physical_file_id) VALUES(?,?,?,?, ?)", 5);
 
     cass_statement_bind_string(statement, 0, path);
@@ -56,6 +73,21 @@ CassFuture* CassandraFS::create_entry(const char* path, CassUuid* uuid, mode_t m
     cass_statement_bind_int64(statement, 2, time(NULL)*1000);
     cass_statement_bind_int64(statement, 3, time(NULL)*1000);
     cass_statement_bind_uuid(statement, 4, *uuid);
+
+    CassFuture* result_future = cass_session_execute(ctxt->session, statement);
+
+    cass_statement_free(statement);
+
+    return result_future;
+}
+
+CassFuture* CassandraFS::create_dir_entry(const char* path, mode_t mode) {
+    CassStatement* statement = cass_statement_new("INSERT INTO entries(path, mode, created_at, modified_at) VALUES(?,?,?,?)", 4);
+
+    cass_statement_bind_string(statement, 0, path);
+    cass_statement_bind_int32(statement, 1, mode);
+    cass_statement_bind_int64(statement, 2, time(NULL)*1000);
+    cass_statement_bind_int64(statement, 3, time(NULL)*1000);
 
     CassFuture* result_future = cass_session_execute(ctxt->session, statement);
 
@@ -545,7 +577,7 @@ int CassandraFS::unlink(const char* path) {
     CassFuture* result_future3 = remove_sub_entries(path);
     CassFuture* result_future4 = NULL;
     
-    if (S_ISREG(stat.st_mode)) {
+    if (!S_ISDIR(stat.st_mode)) {
         result_future4 = remove_physical_file(&stat, &cfs_attrs);
     }
 

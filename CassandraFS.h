@@ -43,7 +43,8 @@ public:
     CassFuture* remove_sub_entry(const char* path);
 
 protected:
-    CassFuture* create_entry(const char* path, CassUuid* uuid, mode_t mode);
+    CassFuture* create_file_entry(const char* path, CassUuid* uuid, mode_t mode);
+    CassFuture* create_dir_entry(const char* path, mode_t mode);
     CassFuture* create_physical_file(CassUuid* uuid);
     CassFuture* create_sub_entry(const char* path);
     CassFuture* remove_sub_entries(const char* path);
