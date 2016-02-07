@@ -358,6 +358,10 @@ int remove_file_entry(const char* path) {
         cassandra_log_error(result_future3);
         error = 1;
     } 
+
+    cass_future_free(result_future);
+    cass_future_free(result_future2);
+    cass_future_free(result_future3);
     
     if (error) {
         return -EACCES;

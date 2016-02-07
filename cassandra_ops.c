@@ -157,6 +157,8 @@ unsigned char* cassandra_read_block(CassSession* session, const char* path, int 
     unsigned char* return_data = NULL;
 
     CassFuture* result_future = cass_session_execute(session, statement);
+    cass_statement_free(statement);
+
 
     if (cass_future_error_code(result_future) == CASS_OK) {
 		/* Retrieve result set and iterate over the rows */
@@ -199,6 +201,7 @@ void cassandra_write_block(CassSession* session, const char* path, int block, co
     cass_statement_bind_int32(statement, 3, length);
 
     CassFuture* result_future = cass_session_execute(session, statement);
+    cass_statement_free(statement);
 
     if (cass_future_error_code(result_future) == CASS_OK) {
 		// Do nothing
@@ -216,6 +219,7 @@ void cassandra_update_file_length(CassSession* session, const char* path, long s
     cass_statement_bind_string(statement, 1, path);
 
     CassFuture* result_future = cass_session_execute(session, statement);
+    cass_statement_free(statement);
 
     if (cass_future_error_code(result_future) == CASS_OK) {
 		// Do nothing
@@ -272,6 +276,7 @@ int cassandra_getattr(CassSession* session, const char* path, struct stat *stbuf
     cass_statement_bind_string(statement, 0, path);
 
     CassFuture* result_future = cass_session_execute(session, statement);
+    cass_statement_free(statement);
 
     if (cass_future_error_code(result_future) == CASS_OK) {
 		/* Retrieve result set and iterate over the rows */
@@ -326,5 +331,4 @@ int cassandra_getattr(CassSession* session, const char* path, struct stat *stbuf
 	}
 
     return 0;
-
 }
