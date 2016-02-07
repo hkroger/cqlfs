@@ -27,71 +27,76 @@ int cql_access(const char* path, int mask) {
 }
 
 int cql_truncate(const char* path, off_t size) {
-    not_implemented("truncate: %s, size: %lld\n", path, size);
+    debug("truncate: %s, size: %lld\n", path, size);
+    int err = cassandra_truncate(session, path, size);
+
+    if (err != 0) {
+	return -EIO;
+    }
+
+    return 0;
 }
 
 int cql_ftruncate(const char* path, off_t size, struct fuse_file_info* fi) {
-    not_implemented("ftruncate: %s, size: %lld\n", path, size);
+    debug("ftruncate: %s, size: %lld (passing on to 'truncate')\n", path, size);
+    return cql_truncate(path, size);
 }
 
-int cql_write(const char* path, const char *buf, size_t size, off_t offset, struct fuse_file_info* fi) {
-    not_implemented("write: %s, size: %zu, offset: %lld\n", path, size, offset);
-}
+
 
 int cql_getattr(const char *path, struct stat *stbuf) {
     debug("getattr: %s\n", path);
-    int found = 0;
-    memset(stbuf, 0, sizeof(struct stat));
+    struct cfs_attrs cfs;
 
-    CassStatement* statement = cass_statement_new("SELECT mode, modified_at FROM entries WHERE path = ?", 1);
-    cass_statement_bind_string(statement, 0, path);
-
-    CassFuture* result_future = cass_session_execute(session, statement);
-
-    if(cass_future_error_code(result_future) == CASS_OK) {
-	/* Retrieve result set and iterate over the rows */
-	const CassResult* result = cass_future_get_result(result_future);
-	CassIterator* rows = cass_iterator_from_result(result);
-
-	if (cass_iterator_next(rows)) {
-	    const CassRow* row = cass_iterator_get_row(rows);
-	    const CassValue* value = cass_row_get_column_by_name(row, "mode");
-	    const CassValue* modified_at_value = cass_row_get_column_by_name(row, "modified_at");
-
-	    int mode;
-	    cass_value_get_int32(value, &mode);
-	    stbuf->st_mode = mode;
-            if (!cass_value_is_null(modified_at_value)) {
-		cass_int64_t modified_at;
-		cass_value_get_int64(modified_at_value, &modified_at);
-	    	stbuf->st_mtime = modified_at / 1000;
-            }
-	    stbuf->st_nlink = 1;
-	    found = 1;
-	}
-
-	cass_result_free(result);
-	cass_iterator_free(rows);
-    } else {
-	/* Handle error */
-	cassandra_log_error(result_future);
-    }
-    cass_future_free(result_future);
-    
-    if (!found) {
-        debug("getattr: returning -ENOENT (path: %s)", path);
-	return -ENOENT;
-    }
-    
-    debug("getattr: returning 0 (path: %s)", path);
-    return 0;
+    return cassandra_getattr(session, path, stbuf, &cfs);
 }
 
 int cql_fgetattr(const char* path, struct stat* stbuf, struct fuse_file_info *info) {
     debug("fgetattr: %s\n", path);
-    return cql_getattr(path, stbuf);
+    struct cfs_attrs cfs;
+    
+    return cassandra_getattr(session, path, stbuf, &cfs);
 }
 
+long min(long a, long b) {
+    if (a<b)
+		return a;
+
+    return b;
+}
+
+int cql_write(const char* path, const char *param_buf, size_t size, off_t offset, struct fuse_file_info* fi) {
+    debug("write: %s, size: %zu, offset: %lld\n", path, size, offset);
+    struct cfs_attrs cfs;
+    struct stat stat;
+    const unsigned char* buf = (unsigned char*)param_buf;
+    cassandra_getattr(session, path, &stat, &cfs);
+
+    if (cfs.block_size <= 0) {
+		debug("write: invalid block size: %d", cfs.block_size);
+		return -EIO;
+    }
+
+    int current_block = offset / cfs.block_size;
+    int current_block_offset = offset % cfs.block_size;
+    long bytes_written = 0;
+
+    while (bytes_written < size) {
+		long bytes_to_write = min(size - bytes_written, cfs.block_size - current_block_offset);
+
+		int err = cassandra_update_block(session, path, current_block, current_block_offset, buf + bytes_written, bytes_to_write, &stat, &cfs);
+
+		if (err != 0) {
+	    	return bytes_written;
+		}
+
+		bytes_written += bytes_to_write;
+		current_block++;
+		current_block_offset = 0;
+    }
+
+    return bytes_written;
+}
 
 int cql_open(const char *path, struct fuse_file_info *fi) {
     debug("open: %s\n", path);
@@ -106,49 +111,48 @@ int cql_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
     CassStatement* statement_entry = cass_statement_new("select mode FROM entries WHERE path = ?", 1);
     cass_statement_bind_string(statement_entry, 0, path);
     CassFuture* entry_result_future = cass_session_execute(session, statement_entry);
+    cass_statement_free(statement_entry);
 
-    CassStatement* statement = cass_statement_new("select sub_path FROM sub_entries WHERE parent_path = ?", 1);
-    cass_statement_bind_string(statement, 0, path);
-    CassFuture* result_future = cass_session_execute(session, statement);
+    CassFuture* result_future = cassandra_sub_entries(session, path, 0);
 
     int res1 = cass_future_error_code(entry_result_future) == CASS_OK;
     int res2 = cass_future_error_code(result_future) == CASS_OK;
 
     if (res1 && res2) {
-	/* Retrieve result set and iterate over the rows */
-	const CassResult* result = cass_future_get_result(entry_result_future);
-	CassIterator* rows = cass_iterator_from_result(result);
+		/* Retrieve result set and iterate over the rows */
+		const CassResult* result = cass_future_get_result(entry_result_future);
+		CassIterator* rows = cass_iterator_from_result(result);
 
-	if (cass_iterator_next(rows)) {
-	    filler(buf, ".", NULL, 0);           /* Current directory (.)  */
-	    filler(buf, "..", NULL, 0);          /* Parent directory (..)  */
-	    direxists = 1;
-	}
+		if (cass_iterator_next(rows)) {
+		    filler(buf, ".", NULL, 0);           /* Current directory (.)  */
+		    filler(buf, "..", NULL, 0);          /* Parent directory (..)  */
+		    direxists = 1;
+		}
 
-	cass_iterator_free(rows);
+		cass_iterator_free(rows);
 
-	if (direxists) {
-	    /* Retrieve result set and iterate over the rows */
-	    const CassResult* result2 = cass_future_get_result(result_future);
-	    CassIterator* rows2 = cass_iterator_from_result(result2);
+		if (direxists) {
+		    /* Retrieve result set and iterate over the rows */
+		    const CassResult* result2 = cass_future_get_result(result_future);
+		    CassIterator* rows2 = cass_iterator_from_result(result2);
 
-	    while (cass_iterator_next(rows2)) {
-		const CassRow* row = cass_iterator_get_row(rows2);
-		const CassValue* value = cass_row_get_column_by_name(row, "sub_path");
+		    while (cass_iterator_next(rows2)) {
+			const CassRow* row = cass_iterator_get_row(rows2);
+			const CassValue* value = cass_row_get_column(row, 0);
 
-		const char* sub_path;
-		size_t sub_path_length;
-		cass_value_get_string(value, &sub_path, &sub_path_length);
-		// Turn non null terminating string into null terminating string
-		char *sub_path_null_terminating = calloc(1, sub_path_length + 1);
-		memcpy(sub_path_null_terminating, sub_path, sub_path_length);
-		filler(buf, sub_path_null_terminating, NULL, 0); 
-		free(sub_path_null_terminating);
-	    }
+			const char* sub_path;
+			size_t sub_path_length;
+			cass_value_get_string(value, &sub_path, &sub_path_length);
+			// Turn non null terminating string into null terminating string
+			char *sub_path_null_terminating = calloc(1, sub_path_length + 1);
+			memcpy(sub_path_null_terminating, sub_path, sub_path_length);
+			filler(buf, sub_path_null_terminating, NULL, 0); 
+			free(sub_path_null_terminating);
+		    }
 
-	    cass_result_free(result2);
-	    cass_iterator_free(rows2);
-	}
+		    cass_result_free(result2);
+		    cass_iterator_free(rows2);
+		}
     }
 
     if (!res1) {
@@ -164,27 +168,39 @@ int cql_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
     return res1 && res2 ? (direxists ? 0 : -ENOENT) : -EACCES;
 }
 
-int cql_read(const char *path, char *buf, size_t size, off_t offset, struct fuse_file_info *fi) {
-    debug("read: %s\n", path);
-    
-    return -ENOENT;
+int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struct fuse_file_info *fi) {
+    debug("read: %s, size: %zu, offset: %lld\n", path, size, offset);
+    struct cfs_attrs cfs;
+    struct stat stat;
+    unsigned char* buf = (unsigned char*)param_buf;
+    int err = cassandra_getattr(session, path, &stat, &cfs);
 
-          
-//    if (strcmp(path, file_path) != 0) {
-//        return -ENOENT;
-//    }
-//
-//    if (offset >= file_size) { /* Trying to read past the end of file. */
-//        return 0;
-//    }
-//
-//    if (offset + size > file_size) { /* Trim the read to the file size. */
-//        size = file_size - offset;
-//    }
-//
-//    memcpy(buf, file_content + offset, size); /* Provide the content. */
-//
-//    return size;
+    if (err != 0) {
+		return err;
+    }
+
+    if (cfs.block_size <= 0) {
+		debug("write: invalid block size: %d", cfs.block_size);
+		return -EIO;
+    }
+
+    int current_block = offset / cfs.block_size;
+    int current_block_offset = offset % cfs.block_size;
+    long bytes_read = 0;
+
+    while (bytes_read < size && offset + bytes_read < stat.st_size) {
+		int length = 0;
+		unsigned char* data = cassandra_read_block(session, path, current_block, &length);
+
+		memcpy(buf + bytes_read, data + current_block_offset, min(length-current_block_offset, size-bytes_read));
+		free(data);
+
+		bytes_read += length-current_block_offset;
+		current_block++;
+		current_block_offset = 0;
+    }
+
+    return bytes_read;
 }
 
 void* cql_init(struct fuse_conn_info *conn) {
@@ -233,7 +249,10 @@ int cql_removexattr(const char *path, const char *name) {
 }
 
 int cql_utimens(const char* path, const struct timespec ts[]) {
-    not_implemented("utimens: %s", path);
+    debug("utimens: %s", path);
+
+    // TODO: actually update stuff
+    return 0;
 }
 
 int cql_bmap(const char* path, size_t blocksize, uint64_t* blockno) {
@@ -260,7 +279,7 @@ int cql_flush(const char* path, struct fuse_file_info* fi) {
 
 int create_file_entry(const char* path, mode_t mode) {
     CassFuture* result_future = cassandra_create_entry(session, path, mode);
-    CassFuture* result_future2 = cassandra_create_sub_entry(session, path, mode);
+    CassFuture* result_future2 = cassandra_create_sub_entry(session, path);
 
     int return_code = cass_future_error_code(result_future);
     return_code = return_code || cass_future_error_code(result_future2);
@@ -393,8 +412,31 @@ int cql_statfs(const char* path, struct statvfs* stbuf) {
     not_implemented("statfs: %s", path);
 }
 
+int dir_has_files(const char* path) {
+    CassFuture* result_future = cassandra_sub_entries(session, path, 1);
+    int rows = 0;
+
+    if (cass_future_error_code(result_future) != CASS_OK) {
+	cass_future_free(result_future);
+	return 1;
+    }
+
+    const CassResult* result = cass_future_get_result(result_future);
+
+    rows = cass_result_row_count(result);
+    cass_result_free(result);
+    cass_future_free(result_future);
+    return (rows > 0);
+}
+
 int cql_rmdir(const char* path) {
-    not_implemented("rmdir: %s", path);
+    debug("rmdir: %s", path);
+
+    if (dir_has_files(path)) {
+	return -ENOTEMPTY;
+    }
+
+    return remove_file_entry(path);
 }
 
 int cql_fsync(const char* path, int isdatasync, struct fuse_file_info* fi) {
@@ -434,9 +476,9 @@ struct fuse_operations cqlfs_filesystem_operations = {
 //    .opendir     = cql_opendir,
 //    .releasedir  = cql_releasedir,
     .fsync       = cql_fsync,
-    .flush       = cql_flush,
+//    .flush       = cql_flush,
     .fsyncdir    = cql_fsyncdir,
-    .lock        = cql_lock,
+//    .lock        = cql_lock,
     .bmap        = cql_bmap,
 //    .poll        = cql_poll,
 #ifdef HAVE_SETXATTR

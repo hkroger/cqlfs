@@ -1,5 +1,6 @@
 CC=gcc 
-CPPFLAGS=-Wall -Werror
+CPPFLAGS=
+CFLAGS=-Wall -Werror -g
 INCLUDES=-I/usr/local/include/osxfuse/fuse 
 OBJS=$(patsubst %.c,%.o,$(wildcard *.c))
 LDLIBS=-lcassandra -losxfuse

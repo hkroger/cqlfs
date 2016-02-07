@@ -1,6 +1,7 @@
 #!/bin/bash
 
 cd `dirname $0`
-umount mnt
+umount ../mnt
 make 
-./cqlfs mnt 
+./cqlfs -s ../mnt 
+sleep 1
