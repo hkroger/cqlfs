@@ -31,7 +31,7 @@ int cql_truncate(const char* path, off_t size) {
     int err = cassandra_truncate(session, path, size);
 
     if (err != 0) {
-	return -EIO;
+        return -EIO;
     }
 
     return 0;
@@ -60,7 +60,7 @@ int cql_fgetattr(const char* path, struct stat* stbuf, struct fuse_file_info *in
 
 long min(long a, long b) {
     if (a<b)
-		return a;
+        return a;
 
     return b;
 }
@@ -73,8 +73,8 @@ int cql_write(const char* path, const char *param_buf, size_t size, off_t offset
     cassandra_getattr(session, path, &stat, &cfs);
 
     if (cfs.block_size <= 0) {
-		debug("write: invalid block size: %d", cfs.block_size);
-		return -EIO;
+        debug("write: invalid block size: %d", cfs.block_size);
+        return -EIO;
     }
 
     int current_block = offset / cfs.block_size;
@@ -82,17 +82,17 @@ int cql_write(const char* path, const char *param_buf, size_t size, off_t offset
     long bytes_written = 0;
 
     while (bytes_written < size) {
-		long bytes_to_write = min(size - bytes_written, cfs.block_size - current_block_offset);
+        long bytes_to_write = min(size - bytes_written, cfs.block_size - current_block_offset);
 
-		int err = cassandra_update_block(session, path, current_block, current_block_offset, buf + bytes_written, bytes_to_write, &stat, &cfs);
+        int err = cassandra_update_block(session, path, current_block, current_block_offset, buf + bytes_written, bytes_to_write, &stat, &cfs);
 
-		if (err != 0) {
-	    	return bytes_written;
-		}
+        if (err != 0) {
+            return bytes_written;
+        }
 
-		bytes_written += bytes_to_write;
-		current_block++;
-		current_block_offset = 0;
+        bytes_written += bytes_to_write;
+        current_block++;
+        current_block_offset = 0;
     }
 
     return bytes_written;
@@ -119,48 +119,48 @@ int cql_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
     int res2 = cass_future_error_code(result_future) == CASS_OK;
 
     if (res1 && res2) {
-		/* Retrieve result set and iterate over the rows */
-		const CassResult* result = cass_future_get_result(entry_result_future);
-		CassIterator* rows = cass_iterator_from_result(result);
+        /* Retrieve result set and iterate over the rows */
+        const CassResult* result = cass_future_get_result(entry_result_future);
+        CassIterator* rows = cass_iterator_from_result(result);
 
-		if (cass_iterator_next(rows)) {
-		    filler(buf, ".", NULL, 0);           /* Current directory (.)  */
-		    filler(buf, "..", NULL, 0);          /* Parent directory (..)  */
-		    direxists = 1;
-		}
+        if (cass_iterator_next(rows)) {
+            filler(buf, ".", NULL, 0);           /* Current directory (.)  */
+            filler(buf, "..", NULL, 0);          /* Parent directory (..)  */
+            direxists = 1;
+        }
 
-		cass_iterator_free(rows);
+        cass_iterator_free(rows);
 
-		if (direxists) {
-		    /* Retrieve result set and iterate over the rows */
-		    const CassResult* result2 = cass_future_get_result(result_future);
-		    CassIterator* rows2 = cass_iterator_from_result(result2);
+        if (direxists) {
+            /* Retrieve result set and iterate over the rows */
+            const CassResult* result2 = cass_future_get_result(result_future);
+            CassIterator* rows2 = cass_iterator_from_result(result2);
 
-		    while (cass_iterator_next(rows2)) {
-			const CassRow* row = cass_iterator_get_row(rows2);
-			const CassValue* value = cass_row_get_column(row, 0);
+            while (cass_iterator_next(rows2)) {
+                const CassRow* row = cass_iterator_get_row(rows2);
+                const CassValue* value = cass_row_get_column(row, 0);
 
-			const char* sub_path;
-			size_t sub_path_length;
-			cass_value_get_string(value, &sub_path, &sub_path_length);
-			// Turn non null terminating string into null terminating string
-			char *sub_path_null_terminating = calloc(1, sub_path_length + 1);
-			memcpy(sub_path_null_terminating, sub_path, sub_path_length);
-			filler(buf, sub_path_null_terminating, NULL, 0); 
-			free(sub_path_null_terminating);
-		    }
+                const char* sub_path;
+                size_t sub_path_length;
+                cass_value_get_string(value, &sub_path, &sub_path_length);
+                // Turn non null terminating string into null terminating string
+                char *sub_path_null_terminating = calloc(1, sub_path_length + 1);
+                memcpy(sub_path_null_terminating, sub_path, sub_path_length);
+                filler(buf, sub_path_null_terminating, NULL, 0); 
+                free(sub_path_null_terminating);
+            }
 
-		    cass_result_free(result2);
-		    cass_iterator_free(rows2);
-		}
+            cass_result_free(result2);
+            cass_iterator_free(rows2);
+        }
     }
 
     if (!res1) {
-	cassandra_log_error(entry_result_future);
+        cassandra_log_error(entry_result_future);
     }
 
     if (!res2) {
-	cassandra_log_error(result_future);
+        cassandra_log_error(result_future);
     }
 
     cass_future_free(entry_result_future);
@@ -176,12 +176,12 @@ int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struc
     int err = cassandra_getattr(session, path, &stat, &cfs);
 
     if (err != 0) {
-		return err;
+        return err;
     }
 
     if (cfs.block_size <= 0) {
-		debug("write: invalid block size: %d", cfs.block_size);
-		return -EIO;
+        debug("write: invalid block size: %d", cfs.block_size);
+        return -EIO;
     }
 
     int current_block = offset / cfs.block_size;
@@ -189,17 +189,19 @@ int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struc
     long bytes_read = 0;
 
     while (bytes_read < size && offset + bytes_read < stat.st_size) {
-		int length = 0;
-		unsigned char* data = cassandra_read_block(session, path, current_block, &length);
+        int length = 0;
+        unsigned char* data = cassandra_read_block(session, path, current_block, &length);
+        int bytes_to_be_copied = min(length-current_block_offset, size-bytes_read);
 
-		memcpy(buf + bytes_read, data + current_block_offset, min(length-current_block_offset, size-bytes_read));
-		free(data);
+        memcpy(buf + bytes_read, data + current_block_offset, bytes_to_be_copied);
+        free(data);
 
-		bytes_read += length-current_block_offset;
-		current_block++;
-		current_block_offset = 0;
+        bytes_read += bytes_to_be_copied;
+        current_block++;
+        current_block_offset = 0;
     }
 
+    debug("bytes_read: %ld", bytes_read);
     return bytes_read;
 }
 
@@ -218,7 +220,7 @@ void* cql_init(struct fuse_conn_info *conn) {
 
     if (cass_future_error_code(connect_future) != CASS_OK) {
         /* Handle error */
-	cassandra_log_error(connect_future);
+        cassandra_log_error(connect_future);
         exit(1);
     }
 
@@ -417,8 +419,8 @@ int dir_has_files(const char* path) {
     int rows = 0;
 
     if (cass_future_error_code(result_future) != CASS_OK) {
-	cass_future_free(result_future);
-	return 1;
+        cass_future_free(result_future);
+        return 1;
     }
 
     const CassResult* result = cass_future_get_result(result_future);
@@ -433,7 +435,7 @@ int cql_rmdir(const char* path) {
     debug("rmdir: %s", path);
 
     if (dir_has_files(path)) {
-	return -ENOTEMPTY;
+        return -ENOTEMPTY;
     }
 
     return remove_file_entry(path);
