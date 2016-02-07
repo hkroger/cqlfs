@@ -7,7 +7,6 @@ USE cqlfs;
 
 CREATE TABLE entries (
   path text,
-  block_size int,
   created_at timestamp,
   mode int,
   modified_at timestamp,
@@ -79,5 +78,4 @@ CREATE TABLE sub_entries (
   memtable_flush_period_in_ms=0 AND
   compaction={'class': 'SizeTieredCompactionStrategy'} AND
   compression={'sstable_compression': 'LZ4Compressor'};
-
 
