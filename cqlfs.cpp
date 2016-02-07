@@ -6,20 +6,19 @@
 #include <string.h>
 #include <libgen.h>
 
+#define _FILE_OFFSET_BITS 64
+#define FUSE_USE_VERSION  26
+#include <osxfuse/fuse/fuse.h>
+
 #include "cqlfs_common.h"
 
-#include "cassandra_ops.h"
+#include "CassandraFS.h"
 
 #define not_implemented(x...) debug("not implemented: " x);return -ENOSYS;
 
-#define _FILE_OFFSET_BITS 64
-#define FUSE_USE_VERSION  26
-#include <fuse.h>
 
-CassCluster* cluster = NULL;
-CassSession* session = NULL;
-CassTimestampGen* timestamp_gen = NULL;
-
+CassandraContext* cassandraCtxt;
+CassandraFS* cassandraFS;
 
 int cql_access(const char* path, int mask) {
     debug("access: %s, mask: %d\n", path, mask);
@@ -28,18 +27,12 @@ int cql_access(const char* path, int mask) {
 
 int cql_truncate(const char* path, off_t size) {
     debug("truncate: %s, size: %lld\n", path, size);
-    int err = cassandra_truncate(session, path, size);
-
-    if (err != 0) {
-        return -EIO;
-    }
-
-    return 0;
+    return cassandraFS->truncate(path, size);
 }
 
 int cql_ftruncate(const char* path, off_t size, struct fuse_file_info* fi) {
-    debug("ftruncate: %s, size: %lld (passing on to 'truncate')\n", path, size);
-    return cql_truncate(path, size);
+    debug("ftruncate: %s, size: %lld\n", path, size);
+    return cassandraFS->truncate(path, size);
 }
 
 
@@ -48,14 +41,14 @@ int cql_getattr(const char *path, struct stat *stbuf) {
     debug("getattr: %s\n", path);
     struct cfs_attrs cfs;
 
-    return cassandra_getattr(session, path, stbuf, &cfs);
+    return cassandraFS->getattr(path, stbuf, &cfs);
 }
 
 int cql_fgetattr(const char* path, struct stat* stbuf, struct fuse_file_info *info) {
     debug("fgetattr: %s\n", path);
     struct cfs_attrs cfs;
     
-    return cassandra_getattr(session, path, stbuf, &cfs);
+    return cassandraFS->getattr(path, stbuf, &cfs);
 }
 
 long min(long a, long b) {
@@ -70,7 +63,7 @@ int cql_write(const char* path, const char *param_buf, size_t size, off_t offset
     struct cfs_attrs cfs;
     struct stat stat;
     const unsigned char* buf = (unsigned char*)param_buf;
-    cassandra_getattr(session, path, &stat, &cfs);
+    cassandraFS->getattr(path, &stat, &cfs);
 
     if (cfs.block_size <= 0) {
         debug("write: invalid block size: %d", cfs.block_size);
@@ -84,7 +77,7 @@ int cql_write(const char* path, const char *param_buf, size_t size, off_t offset
     while (bytes_written < size) {
         long bytes_to_write = min(size - bytes_written, cfs.block_size - current_block_offset);
 
-        int err = cassandra_update_block(session, path, current_block, current_block_offset, buf + bytes_written, bytes_to_write, &stat, &cfs);
+        int err = cassandraFS->update_block(&(cfs.physical_file_id), current_block, current_block_offset, buf + bytes_written, bytes_to_write, &stat, &cfs);
 
         if (err != 0) {
             return bytes_written;
@@ -110,10 +103,10 @@ int cql_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 
     CassStatement* statement_entry = cass_statement_new("select mode FROM entries WHERE path = ?", 1);
     cass_statement_bind_string(statement_entry, 0, path);
-    CassFuture* entry_result_future = cass_session_execute(session, statement_entry);
+    CassFuture* entry_result_future = cass_session_execute(cassandraCtxt->session, statement_entry);
     cass_statement_free(statement_entry);
 
-    CassFuture* result_future = cassandra_sub_entries(session, path, 0);
+    CassFuture* result_future = cassandraFS->sub_entries(path, 0);
 
     int res1 = cass_future_error_code(entry_result_future) == CASS_OK;
     int res2 = cass_future_error_code(result_future) == CASS_OK;
@@ -144,7 +137,7 @@ int cql_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
                 size_t sub_path_length;
                 cass_value_get_string(value, &sub_path, &sub_path_length);
                 // Turn non null terminating string into null terminating string
-                char *sub_path_null_terminating = calloc(1, sub_path_length + 1);
+                char *sub_path_null_terminating = (char*)calloc(1, sub_path_length + 1);
                 memcpy(sub_path_null_terminating, sub_path, sub_path_length);
                 filler(buf, sub_path_null_terminating, NULL, 0); 
                 free(sub_path_null_terminating);
@@ -173,7 +166,7 @@ int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struc
     struct cfs_attrs cfs;
     struct stat stat;
     unsigned char* buf = (unsigned char*)param_buf;
-    int err = cassandra_getattr(session, path, &stat, &cfs);
+    int err = cassandraFS->getattr(path, &stat, &cfs);
 
     if (err != 0) {
         return err;
@@ -190,7 +183,7 @@ int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struc
 
     while (bytes_read < size && offset + bytes_read < stat.st_size) {
         int length = 0;
-        unsigned char* data = cassandra_read_block(session, path, current_block, &length);
+        unsigned char* data = cassandraFS->read_block(&(cfs.physical_file_id), current_block, &length);
         int bytes_to_be_copied = min(length-current_block_offset, size-bytes_read);
 
         memcpy(buf + bytes_read, data + current_block_offset, bytes_to_be_copied);
@@ -209,23 +202,22 @@ void* cql_init(struct fuse_conn_info *conn) {
     openlog("cqlfs", 0, LOG_DAEMON);
     debug("Starting CQLFS");
     /* Add contact points */
-    cluster = cass_cluster_new();
-    session = cass_session_new();
-    timestamp_gen = cass_timestamp_gen_monotonic_new();
-    cass_cluster_set_timestamp_gen(cluster, timestamp_gen);
+    cassandraCtxt = new CassandraContext();
+
     CassFuture* connect_future = NULL;
 
-    cass_cluster_set_contact_points(cluster, "127.0.0.1");
-    connect_future = cass_session_connect_keyspace(session, cluster, "cqlfs");
+    cass_cluster_set_contact_points(cassandraCtxt->cluster, "127.0.0.1");
+    connect_future = cass_session_connect_keyspace(cassandraCtxt->session, cassandraCtxt->cluster, "cqlfs");
 
     if (cass_future_error_code(connect_future) != CASS_OK) {
         /* Handle error */
         cassandra_log_error(connect_future);
         exit(1);
     }
+    cassandraFS = new CassandraFS(cassandraCtxt);
 
     debug("Connection to Cassandra successful");
-    cassandra_log_keyspaces(session);
+    cassandra_log_keyspaces(cassandraCtxt);
 
     return NULL;
 }
@@ -280,16 +272,13 @@ int cql_flush(const char* path, struct fuse_file_info* fi) {
 }
 
 int create_file_entry(const char* path, mode_t mode) {
-    CassFuture* result_future = cassandra_create_entry(session, path, mode);
-    CassFuture* result_future2 = cassandra_create_sub_entry(session, path);
+    int err = cassandraFS->create_file(path, mode);
 
-    int return_code = cass_future_error_code(result_future);
-    return_code = return_code || cass_future_error_code(result_future2);
+    if (err != CASS_OK) {
+        return -EIO;
+    }
 
-    cass_future_free(result_future);
-    cass_future_free(result_future2);
-
-    return return_code;
+    return 0;
 }
 
 int cql_mkdir(const char* path, mode_t mode) {
@@ -338,44 +327,10 @@ int cql_lock(const char* path, struct fuse_file_info* fi, int cmd, struct flock*
     return 0;
 }
 
-
-int remove_file_entry(const char* path) {
-    CassFuture* result_future = cassandra_remove_entry(session, path);
-    CassFuture* result_future2 = cassandra_remove_sub_entry(session, path);
-    CassFuture* result_future3 = cassandra_remove_sub_entries(session, path);
-    int error = 0;
-    if (cass_future_error_code(result_future) != CASS_OK) {
-        cassandra_log_error(result_future);
-        error = 1;
-    } 
-
-    if (cass_future_error_code(result_future2) != CASS_OK) {
-        cassandra_log_error(result_future2);
-        error = 1;
-    } 
-
-    if (cass_future_error_code(result_future3) != CASS_OK) {
-        cassandra_log_error(result_future3);
-        error = 1;
-    } 
-
-    cass_future_free(result_future);
-    cass_future_free(result_future2);
-    cass_future_free(result_future3);
-    
-    if (error) {
-        return -EACCES;
-    }
-    
-    return 0;
-}
-
-
-
 int cql_unlink(const char* path) {
     debug("unlink: %s", path);
 
-    return remove_file_entry(path);
+    return cassandraFS->unlink(path);
 }
 
 int cql_chmod(const char* path, mode_t mode) {
@@ -386,20 +341,38 @@ int cql_chown(const char* path, uid_t uid, gid_t gid) {
     not_implemented("chown: %s", path);
 }
 
-int copy_file_entry(const char* from, const char* to) {
-    return cassandra_copy_full_entry(session, from, to);
+int hardlink(const char* from, const char* to) {
+    return cassandraFS->hardlink(from, to);
 }
 
 int cql_rename(const char* from, const char* to) {
     debug("rename: %s -> %s", from, to);
 
-    int err = copy_file_entry(from, to);
+    int err = hardlink(from, to);
 
     if (err != 0) {
         return err;
     }
 
-    return remove_file_entry(from);
+    CassFuture* result_future = cassandraFS->remove_entry(from);
+    CassFuture* result_future2 = cassandraFS->remove_sub_entry(from);
+
+    if (cass_future_error_code(result_future) != CASS_OK) {
+        /* Handle error */
+        cassandra_log_error(result_future);
+        err = -EIO;
+    }
+
+    if (cass_future_error_code(result_future2) != CASS_OK) {
+        /* Handle error */
+        cassandra_log_error(result_future2);
+        err = -EIO;
+    }
+
+    cass_future_free(result_future);
+    cass_future_free(result_future2);
+
+    return err;
 }
 
 int cql_readlink(const char* path, char* buf, size_t size) {
@@ -419,7 +392,7 @@ int cql_statfs(const char* path, struct statvfs* stbuf) {
 }
 
 int dir_has_files(const char* path) {
-    CassFuture* result_future = cassandra_sub_entries(session, path, 1);
+    CassFuture* result_future = cassandraFS->sub_entries(path, 1);
     int rows = 0;
 
     if (cass_future_error_code(result_future) != CASS_OK) {
@@ -442,7 +415,7 @@ int cql_rmdir(const char* path) {
         return -ENOTEMPTY;
     }
 
-    return remove_file_entry(path);
+    return cassandraFS->unlink(path);
 }
 
 int cql_fsync(const char* path, int isdatasync, struct fuse_file_info* fi) {
@@ -465,7 +438,7 @@ struct fuse_operations cqlfs_filesystem_operations = {
     .readdir     = cql_readdir,
     .mkdir       = cql_mkdir,  
     .init        = cql_init,
-    .destroy     = cql_destroy,
+//    .destroy     = cql_destroy,
     .readlink    = cql_readlink,
     .mknod       = cql_mknod,
     .symlink     = cql_symlink,

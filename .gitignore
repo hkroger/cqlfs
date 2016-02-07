@@ -4,3 +4,4 @@ cassandratest
 mnt
 nbproject/
 *.o
+cqlfs.dSYM
