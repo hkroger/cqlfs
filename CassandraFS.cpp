@@ -144,6 +144,27 @@ CassFuture* CassandraFS::sub_entries(const char* path, int limit) {
     return result_future;
 }
 
+int CassandraFS::update_mode(const char* path, mode_t new_mode) {
+    CassStatement* statement = cass_statement_new("UPDATE entries SET mode = ? WHERE path = ?", 2);
+    cass_statement_bind_int32(statement, 0, new_mode);
+    cass_statement_bind_string(statement, 1, path);
+
+    CassFuture* result_future = cass_session_execute(ctxt->session, statement);
+    cass_statement_free(statement);
+    int error = 0;
+
+    if (cass_future_error_code(result_future) == CASS_OK) {
+        // Nada
+    } else {
+        /* Handle error */
+        error = -EIO;
+        cassandra_log_error(result_future);
+    }
+    cass_future_free(result_future);
+        
+    return error;
+}
+
 int CassandraFS::hardlink(const char* from, const char* to) {
     int operation_done = 0;
     CassStatement* statement = cass_statement_new("SELECT mode, created_at, modified_at, physical_file_id FROM entries WHERE path = ?", 1);

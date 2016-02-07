@@ -36,6 +36,7 @@ public:
     int getattr(const char* path, struct stat *stbuf, struct cfs_attrs *cfs_attrs);
     unsigned char* read_block(CassUuid* physical_file_id, int block, int* bytes_read);
     void write_block(CassUuid* physical_file_id, int block, const unsigned char* data, int length);
+    int update_mode(const char* path, mode_t new_mode);
     
     CassFuture* remove_entry(const char* path);
     CassFuture* remove_sub_entry(const char* path);

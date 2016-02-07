@@ -333,8 +333,25 @@ int cql_unlink(const char* path) {
     return cassandraFS->unlink(path);
 }
 
+#define PERMISSION_MASK 07777
 int cql_chmod(const char* path, mode_t mode) {
-    not_implemented("chmod: %s", path);
+    debug("chmod: %s", path);
+
+    struct stat stat;
+    struct cfs_attrs cfs_attrs;
+
+    cassandraFS->getattr(path, &stat, &cfs_attrs);
+
+    int permissions = stat.st_mode & 07777;
+    int new_permissions = mode & 07777;
+    
+    if (permissions != new_permissions) {
+        mode_t new_mode = (stat.st_mode & ~PERMISSION_MASK) | new_permissions;
+
+        return cassandraFS->update_mode(path, new_mode);
+    }
+
+    return 0;
 }
 
 int cql_chown(const char* path, uid_t uid, gid_t gid) {
