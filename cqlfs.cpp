@@ -5,23 +5,143 @@
 #include <unistd.h>
 #include <string.h>
 #include <libgen.h>
+#include <mutex>
+#include <map>
+#include <string>
+
 
 #define _FILE_OFFSET_BITS 64
 #define FUSE_USE_VERSION  26
 #include <osxfuse/fuse/fuse.h>
 
 #include "cqlfs_common.h"
-
 #include "CassandraFS.h"
+#include "FileBlockCache.h"
 
 #define not_implemented(x...) debug("not implemented: " x);return -ENOSYS;
-
 
 CassandraContext* cassandraCtxt;
 CassandraFS* cassandraFS;
 
+class StatCache : public Cache {
+public:
+    struct stat stat;
+    CassUuid physical_file_id;
+};
+
+class CfsStatCache : public Cache {
+public:
+    struct cfs_attrs cfs;
+};
+
+// Key uuid
+std::map<std::string, FileBlockCache*> file_block_cache;
+
+// Key uuid
+std::map<std::string, CfsStatCache*> cfs_stat_cache;
+
+// Key path
+std::map<std::string, StatCache*> stat_cache;
+
+std::mutex cache_mutex;
+
+void establish_cache(const char* path) {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+    struct cfs_attrs cfs;
+    int cfs_loaded = 0;
+    CassUuid physical_file_id;
+
+    // Initialize stat cache
+    if (stat_cache.count(path)>0) {
+        stat_cache[path]->inc_user_count();
+        physical_file_id = stat_cache[path]->physical_file_id;
+    } else {
+        StatCache *cache_item = new StatCache();
+        cfs_loaded = 1;
+        cassandraFS->getattr(path, &(cache_item->stat), &cfs);
+        cache_item->physical_file_id = cfs.physical_file_id;
+        physical_file_id = cfs.physical_file_id;
+        cache_item->set_user_count(1);
+        stat_cache[path] = cache_item;
+    }
+
+    char uuid_string[CASS_UUID_STRING_LENGTH];
+    cass_uuid_string(physical_file_id, uuid_string);
+    
+    // Initialize CfsStatCache
+    if (cfs_stat_cache.count(uuid_string)>0) {
+        cfs_stat_cache[uuid_string]->inc_user_count();
+    } else {
+        CfsStatCache *cache_item = new CfsStatCache();
+        if (cfs_loaded) {
+            cache_item->cfs = cfs;
+        } else {
+            // This is an edge case, should not even happen
+            warning("Initializing CFS cache but CFS stats were not loaded. Path: %s, FileID: %s", path, uuid_string);
+            struct stat stat;
+            cassandraFS->getattr(path, &stat, &(cache_item->cfs));
+        }
+        cache_item->set_user_count(1);
+        cfs_stat_cache[uuid_string] = cache_item;
+    }
+
+    // Initialize FileBlockCache
+    if (file_block_cache.count(uuid_string)>0) {
+        file_block_cache[uuid_string]->inc_user_count();
+    } else {
+        FileBlockCache *cache_item = new FileBlockCache();
+        cache_item->set_user_count(1);
+        file_block_cache[uuid_string] = cache_item;
+    }
+}
+
+void release_cache(const char* path) {
+    std::lock_guard<std::mutex> lock(cache_mutex);
+
+    StatCache* stat_item = stat_cache.at(path);
+    
+    char uuid_string[CASS_UUID_STRING_LENGTH];
+    cass_uuid_string(stat_item->physical_file_id, uuid_string);
+
+    if (file_block_cache.count(uuid_string)>0) {
+        FileBlockCache* item = file_block_cache[uuid_string];
+        
+        item->dec_user_count();
+        
+        if (item->user_count()<=0) {
+            file_block_cache.erase(uuid_string);
+        }
+    } else {
+        warning("Path %s was not found cache to be released with uuid: %s", path, uuid_string);
+    }
+
+    if (cfs_stat_cache.count(uuid_string)>0) {
+        CfsStatCache* item = cfs_stat_cache[uuid_string];
+        
+        item->dec_user_count();
+        
+        if (item->user_count()<=0) {
+            cfs_stat_cache.erase(uuid_string);
+        }
+    } else {
+        warning("Path %s was not found cfs stat cache to be released with uuid: %s", path, uuid_string);
+    }
+    
+    if (stat_cache.count(path)>0) {
+        StatCache* item = stat_cache[path];
+        
+        item->dec_user_count();
+        
+        if (item->user_count()<=0) {
+            stat_cache.erase(path);
+        }
+    } else {
+        warning("Path %s was not found stat cache to be release", path);
+    }
+}
+
 int cql_access(const char* path, int mask) {
-    debug("access: %s, mask: %d\n", path, mask);
+    //debug("access: %s, mask: %d\n", path, mask);
     return 0;
 }
 
@@ -60,39 +180,48 @@ long min(long a, long b) {
 
 int cql_write(const char* path, const char *param_buf, size_t size, off_t offset, struct fuse_file_info* fi) {
     debug("write: %s, size: %zu, offset: %lld\n", path, size, offset);
-    struct cfs_attrs cfs;
-    struct stat stat;
     const unsigned char* buf = (unsigned char*)param_buf;
-    cassandraFS->getattr(path, &stat, &cfs);
+    CassandraFutureSpool* spool = new CassandraFutureSpool();
+    
+    StatCache* stat_cache_item = stat_cache[path];
+    char uuid_string[CASS_UUID_STRING_LENGTH];
+    cass_uuid_string(stat_cache_item->physical_file_id, uuid_string);
+    CfsStatCache* cfs_cache_item = cfs_stat_cache[uuid_string];
 
-    if (cfs.block_size <= 0) {
-        debug("write: invalid block size: %d", cfs.block_size);
+    if (cfs_cache_item->cfs.block_size <= 0) {
+        debug("write: invalid block size: %d", cfs_cache_item->cfs.block_size);
         return -EIO;
     }
 
-    int current_block = offset / cfs.block_size;
-    int current_block_offset = offset % cfs.block_size;
+    int current_block = offset / cfs_cache_item->cfs.block_size;
+    int current_block_offset = offset % cfs_cache_item->cfs.block_size;
     long bytes_written = 0;
 
     while (bytes_written < size) {
-        long bytes_to_write = min(size - bytes_written, cfs.block_size - current_block_offset);
+        long bytes_to_write = min(size - bytes_written, cfs_cache_item->cfs.block_size - current_block_offset);
 
-        int err = cassandraFS->update_block(&(cfs.physical_file_id), current_block, current_block_offset, buf + bytes_written, bytes_to_write, &stat, &cfs);
-
-        if (err != 0) {
-            return bytes_written;
-        }
+        cassandraFS->update_block(&(cfs_cache_item->cfs.physical_file_id), current_block, current_block_offset, buf + bytes_written, bytes_to_write, &(stat_cache_item->stat), &(cfs_cache_item->cfs), spool);
 
         bytes_written += bytes_to_write;
         current_block++;
         current_block_offset = 0;
     }
 
+    spool->wait_all();
+    int errors = spool->get_errors();
+
+    delete spool;
+    
+    if (errors > 0) {
+        return 0;
+    }
+    
     return bytes_written;
 }
 
 int cql_open(const char *path, struct fuse_file_info *fi) {
     debug("open: %s\n", path);
+    establish_cache(path);
 
     return 0;
 }
@@ -163,27 +292,26 @@ int cql_readdir(const char *path, void *buf, fuse_fill_dir_t filler, off_t offse
 
 int cql_read(const char *path, char *param_buf, size_t size, off_t offset, struct fuse_file_info *fi) {
     debug("read: %s, size: %zu, offset: %lld\n", path, size, offset);
-    struct cfs_attrs cfs;
-    struct stat stat;
     unsigned char* buf = (unsigned char*)param_buf;
-    int err = cassandraFS->getattr(path, &stat, &cfs);
+    StatCache* stat_cache_item = stat_cache[path];
+    char uuid_string[CASS_UUID_STRING_LENGTH];
+    cass_uuid_string(stat_cache_item->physical_file_id, uuid_string);
+    CfsStatCache* cfs_cache_item = cfs_stat_cache[uuid_string];
 
-    if (err != 0) {
-        return err;
-    }
-
-    if (cfs.block_size <= 0) {
-        debug("write: invalid block size: %d", cfs.block_size);
+    if (cfs_cache_item->cfs.block_size <= 0) {
+        debug("write: invalid block size: %d", cfs_cache_item->cfs.block_size);
         return -EIO;
     }
 
-    int current_block = offset / cfs.block_size;
-    int current_block_offset = offset % cfs.block_size;
+    int current_block = offset / cfs_cache_item->cfs.block_size;
+    int current_block_offset = offset % cfs_cache_item->cfs.block_size;
     long bytes_read = 0;
 
-    while (bytes_read < size && offset + bytes_read < stat.st_size && current_block * cfs.block_size < stat.st_size) {
+    while (bytes_read < size
+           && offset + bytes_read < stat_cache_item->stat.st_size
+           && current_block * cfs_cache_item->cfs.block_size < stat_cache_item->stat.st_size) {
         int length = 0;
-        unsigned char* data = cassandraFS->read_block(&(cfs.physical_file_id), current_block, &length);
+        unsigned char* data = cassandraFS->read_block(&(cfs_cache_item->cfs.physical_file_id), current_block, &length);
         int bytes_to_be_copied = min(length-current_block_offset, size-bytes_read);
 
         memcpy(buf + bytes_read, data + current_block_offset, bytes_to_be_copied);
@@ -218,7 +346,7 @@ void* cql_init(struct fuse_conn_info *conn) {
 
     debug("Connection to Cassandra successful");
     cassandra_log_keyspaces(cassandraCtxt);
-
+    
     return NULL;
 }
 
@@ -300,6 +428,7 @@ int cql_create(const char* path, mode_t mode, struct fuse_file_info *fi) {
     int return_code = create_file_entry(path, mode);
 
     if (return_code == 0) {
+        establish_cache(path);
         return 0;
     }
 
@@ -312,6 +441,8 @@ int cql_opendir(const char* path, struct fuse_file_info* fi) {
 
 int cql_release(const char* path, struct fuse_file_info *fi) {
     debug("release: %s", path);
+    
+    release_cache(path);
 
     return 0;
 }
@@ -484,7 +615,25 @@ struct fuse_operations cqlfs_filesystem_operations = {
 #endif
 };
 
-
+#define ADDITIONAL_PARAMS 4
 int main(int argc, char **argv) {
+    char* param1 = (char*)"-o";
+    char* param2 = (char*)"nolocalcaches";
+    // char* param3 = (char*)"-s";
+    char* param4 = (char*)"iosize=" DEFAULT_BLOCK_SIZE;
+    
+    int new_argc = argc+ADDITIONAL_PARAMS;
+    char** new_argv = (char**)malloc(sizeof(char*) * (new_argc));
+    new_argv[0] = argv[0];
+    new_argv[1] = param1;
+    new_argv[2] = param2;
+    new_argv[3] = param1;
+    new_argv[4] = param4;
+    //new_argv[5] = param3;
+
+    for (int i=1;i<argc;i++) {
+        new_argv[i+ADDITIONAL_PARAMS] = argv[i];
+    }
+    
     return fuse_main(argc, argv, &cqlfs_filesystem_operations, NULL);
 }

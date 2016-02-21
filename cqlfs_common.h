@@ -6,6 +6,7 @@
 
 
 #define debug(x...) syslog(LOG_NOTICE,x)
+#define warning(x...) syslog(LOG_WARNING,x)
 
 #define cassandra_log_error(x) _cassandra_log_error(__FILE__, __LINE__, x)
 

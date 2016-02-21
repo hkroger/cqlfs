@@ -1,7 +1,9 @@
 #!/bin/bash
 
+set -e
+
 cd `dirname $0`
-umount ../mnt
-make 
-./cqlfs -s ../mnt 
+xcodebuild
+umount ../mnt || echo
+./Debug/cqlfs ../mnt 
 sleep 1

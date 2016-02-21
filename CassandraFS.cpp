@@ -4,9 +4,11 @@
 #include <string.h>
 #include <time.h>
 #include <sys/stat.h>
+#include <list>
 
 #include "cqlfs_common.h"
 #include "CassandraFS.h"
+
 
 CassandraFS::CassandraFS(CassandraContext* ctxt) {
     this->ctxt = ctxt;
@@ -97,7 +99,7 @@ CassFuture* CassandraFS::create_dir_entry(const char* path, mode_t mode) {
 }
 
 CassFuture* CassandraFS::create_physical_file(CassUuid* uuid) {
-    CassStatement* statement = cass_statement_new("INSERT INTO physical_files(id, size, block_size) VALUES(?, 0, 65536)", 1);
+    CassStatement* statement = cass_statement_new("INSERT INTO physical_files(id, size, block_size) VALUES(?, 0, " DEFAULT_BLOCK_SIZE ")", 1);
     cass_statement_bind_uuid(statement, 0, *uuid);
     CassFuture* result_future = cass_session_execute(ctxt->session, statement);
 
@@ -297,12 +299,33 @@ int CassandraFS::hardlink(const char* from, const char* to) {
     return error;
 }
 
+static int blocks_needed(size_t data_size, size_t block_size) {
+    int blocks = data_size / block_size;
+    
+    if (data_size % block_size > 0) {
+        blocks++;
+    }
+    
+    return blocks;
+}
+
+CassFuture* CassandraFS::truncate_block(struct stat* stat, struct cfs_attrs* cfs_attrs, int block_number, int size) {
+    CassStatement* statement = cass_statement_new("UPDATE file_blocks SET size = ? WHERE physical_file_id = ? AND block_number = ?", 3);
+    cass_statement_bind_int32(statement, 0, size);
+    cass_statement_bind_uuid(statement, 1, cfs_attrs->physical_file_id);
+    cass_statement_bind_int32(statement, 2, block_number);
+    CassFuture* future = cass_session_execute(ctxt->session, statement);
+    cass_statement_free(statement);
+    
+    return future;
+}
+
 int CassandraFS::truncate(const char* path, off_t size) {
     CassStatement* statement = NULL;
     struct stat stat;
     struct cfs_attrs cfs_attrs;
+    CassandraFutureSpool* spool = new CassandraFutureSpool();
     
-    // TODO: Delete extra blocks
     int err = getattr(path, &stat, &cfs_attrs);
 
     if (err != 0) {
@@ -312,17 +335,28 @@ int CassandraFS::truncate(const char* path, off_t size) {
     statement = cass_statement_new("UPDATE physical_files SET size = ? WHERE id = ?", 2);
     cass_statement_bind_int64(statement, 0, size);
     cass_statement_bind_uuid(statement, 1, cfs_attrs.physical_file_id);
-    CassFuture* result_future = cass_session_execute(ctxt->session, statement);
+    spool->append(cass_session_execute(ctxt->session, statement));
     cass_statement_free(statement);
-    CassError return_code = cass_future_error_code(result_future);
-
-    if (return_code != CASS_OK) {
-        cassandra_log_error(result_future);
-        cass_future_free(result_future);
-        return -EIO;
+    
+    off_t current_size = stat.st_size;
+    int current_blocks = blocks_needed(current_size, cfs_attrs.block_size);
+    int needed_blocks = blocks_needed(size, cfs_attrs.block_size);
+    
+    for (int a = needed_blocks; a<current_blocks; a++) {
+        spool->append(delete_file_block(&stat, &cfs_attrs, a));
     }
 
-	cass_future_free(result_future);
+    if (size % cfs_attrs.block_size > 0) {
+        spool->append(truncate_block(&stat, &cfs_attrs, needed_blocks-1, size % cfs_attrs.block_size));
+    }
+    
+    spool->wait_all();
+    int errors = spool->get_errors();
+    delete spool;
+    
+    if (errors>0) {
+        return -EIO;
+    }
 
     return 0;
 }
@@ -338,7 +372,6 @@ unsigned char* CassandraFS::read_block(CassUuid* physical_file_id, int block, in
 
 
     if (cass_future_error_code(result_future) == CASS_OK) {
-		/* Retrieve result set and iterate over the rows */
 		const CassResult* result = cass_future_get_result(result_future);
 		CassIterator* rows = cass_iterator_from_result(result);
 
@@ -352,11 +385,16 @@ unsigned char* CassandraFS::read_block(CassUuid* physical_file_id, int block, in
 
 	    	cass_value_get_bytes(data_value, &cass_data, &size);
 	    	cass_value_get_int32(size_value, &size2);
-	    
-			// TODO: size & size2 must match
-			return_data = (unsigned char*)malloc(size);
-	    	memcpy(return_data, cass_data, size);
-	    	(*bytes_read) = size;
+            
+            // Let's use the value from "size" field unless bigger than the actual data.
+            if (size2>size) {
+                warning("Problem: size field is showing value %d which is bigger than the actual block data length %zu", size2, size);
+                size2 = size;
+            }
+            
+			return_data = (unsigned char*)malloc(size2);
+	    	memcpy(return_data, cass_data, size2);
+	    	(*bytes_read) = size2;
 		}
 	    
 		cass_result_free(result);
@@ -370,7 +408,7 @@ unsigned char* CassandraFS::read_block(CassUuid* physical_file_id, int block, in
     return return_data;
 }
 
-void CassandraFS::write_block(CassUuid* physical_file_id, int block, const unsigned char* data, int length) {
+void CassandraFS::write_block(CassUuid* physical_file_id, int block, const unsigned char* data, int length, CassandraFutureSpool* spool) {
     CassStatement* statement = cass_statement_new("INSERT INTO file_blocks(physical_file_id, block_number, data, size) VALUES(?,?,?,?)", 4);
     cass_statement_bind_uuid(statement, 0, *physical_file_id);
     cass_statement_bind_int32(statement, 1, block);
@@ -379,18 +417,10 @@ void CassandraFS::write_block(CassUuid* physical_file_id, int block, const unsig
 
     CassFuture* result_future = cass_session_execute(ctxt->session, statement);
     cass_statement_free(statement);
-
-    if (cass_future_error_code(result_future) == CASS_OK) {
-		// Do nothing
-    } else {
-		/* Handle error */
-		cassandra_log_error(result_future);
-    }
-
-    cass_future_free(result_future);
+    spool->append(result_future);
 }
 
-void CassandraFS::update_file_length(CassUuid* physical_file_id, long size) {
+CassFuture* CassandraFS::update_file_length(CassUuid* physical_file_id, long size) {
     CassStatement* statement = cass_statement_new("UPDATE physical_files SET size = ? WHERE id = ?", 2);
     cass_statement_bind_int64(statement, 0, size);
     cass_statement_bind_uuid(statement, 1, *physical_file_id);
@@ -398,14 +428,7 @@ void CassandraFS::update_file_length(CassUuid* physical_file_id, long size) {
     CassFuture* result_future = cass_session_execute(ctxt->session, statement);
     cass_statement_free(statement);
 
-    if (cass_future_error_code(result_future) == CASS_OK) {
-		// Do nothing
-    } else {
-		/* Handle error */
-		cassandra_log_error(result_future);
-    }
-
-    cass_future_free(result_future);
+    return result_future;
 }
 
 
@@ -415,31 +438,42 @@ int CassandraFS::update_block(CassUuid* physical_file_id,
     const unsigned char* buf,
     int bytes_to_write,
     struct stat* stat,
-    struct cfs_attrs* cfs_attrs) {
+    struct cfs_attrs* cfs_attrs,
+    CassandraFutureSpool* spool) {
 
     debug("Updating block %d (offset: %d) with %d bytes", block, block_offset, bytes_to_write);
 
     // If no need to update existing block
     if (block * cfs_attrs->block_size >= stat->st_size) {
-		write_block(physical_file_id, block, buf, bytes_to_write);
+		write_block(physical_file_id, block, buf, bytes_to_write, spool);
     } else { // update existing block
 		int length = 0;
-		unsigned char* data = read_block(physical_file_id, block, &length);
-		if (length<cfs_attrs->block_size) {
-	    	data = (unsigned char*)realloc(data, cfs_attrs->block_size);
-		}
+        unsigned char* data = NULL;
+        int self_allocated = 0;
+        
+        if (block_offset == 0 && bytes_to_write == cfs_attrs->block_size){
+            data = (unsigned char*) buf;
+        } else {
+            self_allocated = 1;
+            data = read_block(physical_file_id, block, &length);
+            if (length<cfs_attrs->block_size) {
+                data = (unsigned char*)realloc(data, cfs_attrs->block_size);
+            }
+            memcpy(data + block_offset, buf, bytes_to_write);            
+        }
 
-		memcpy(data + block_offset, buf, bytes_to_write);
-
-		write_block(physical_file_id, block, data, block_offset + bytes_to_write);
-
-		free(data);
+		write_block(physical_file_id, block, data, block_offset + bytes_to_write, spool);
+        
+        if (self_allocated) {
+            free(data);
+        }
     }
 
     int newsize = block * cfs_attrs->block_size + block_offset + bytes_to_write;
 
     if (newsize > stat->st_size) {
-		update_file_length(physical_file_id, newsize);
+        stat->st_size = newsize;
+		spool->append(update_file_length(physical_file_id, newsize));
     }
 
     return 0;
@@ -552,15 +586,29 @@ int CassandraFS::getattr(const char* path, struct stat *stbuf, struct cfs_attrs 
     return error;
 }
 
-CassFuture* CassandraFS::remove_physical_file(struct stat* stat, struct cfs_attrs* cfs_attrs) {
-    // TODO: Free blocks
+CassFuture* CassandraFS::delete_file_block(struct stat* stat, struct cfs_attrs* cfs_attrs, int block_number) {
+    CassStatement* statement = cass_statement_new("DELETE FROM file_blocks WHERE block_number = ? AND physical_file_id = ?", 2);
+    cass_statement_bind_int32(statement, 0, block_number);
+    cass_statement_bind_uuid(statement, 1, cfs_attrs->physical_file_id);
+    CassFuture* result_future = cass_session_execute(ctxt->session, statement);
+    cass_statement_free(statement);
+    
+    return result_future;
+}
+
+void CassandraFS::remove_physical_file(struct stat* stat, struct cfs_attrs* cfs_attrs, CassandraFutureSpool* spool) {
     CassStatement* statement = cass_statement_new("DELETE FROM physical_files WHERE id = ?", 1);
     cass_statement_bind_uuid(statement, 0, cfs_attrs->physical_file_id);
     CassFuture* result_future = cass_session_execute(ctxt->session, statement);
-
     cass_statement_free(statement);
+    
+    spool->append(result_future);
+    
+    int blocks = blocks_needed(stat->st_size, cfs_attrs->block_size);
 
-    return result_future;
+    for (int i = 0; i<blocks; i++) {
+        spool->append(delete_file_block(stat, cfs_attrs, i));
+    }
 }
 
 int CassandraFS::unlink(const char* path) {
@@ -571,47 +619,22 @@ int CassandraFS::unlink(const char* path) {
     if (attr_err) {
         return attr_err;
     }
+    
+    CassandraFutureSpool *spool = new CassandraFutureSpool();
 
-    CassFuture* result_future = remove_entry(path);
-    CassFuture* result_future2 = remove_sub_entry(path);
-    CassFuture* result_future3 = remove_sub_entries(path);
-    CassFuture* result_future4 = NULL;
+    spool->append(remove_entry(path));
+    spool->append(remove_sub_entry(path));
+    spool->append(remove_sub_entries(path));
     
     if (!S_ISDIR(stat.st_mode)) {
-        result_future4 = remove_physical_file(&stat, &cfs_attrs);
+        remove_physical_file(&stat, &cfs_attrs, spool);
     }
 
-    int error = 0;
-
-    if (cass_future_error_code(result_future) != CASS_OK) {
-        cassandra_log_error(result_future);
-        error = 1;
-    } 
-
-    if (cass_future_error_code(result_future2) != CASS_OK) {
-        cassandra_log_error(result_future2);
-        error = 1;
-    } 
-
-    if (cass_future_error_code(result_future3) != CASS_OK) {
-        cassandra_log_error(result_future3);
-        error = 1;
-    } 
-
-    if (result_future4 != NULL && cass_future_error_code(result_future4) != CASS_OK) {
-        cassandra_log_error(result_future4);
-        error = 1;
-    } 
-
-    cass_future_free(result_future);
-    cass_future_free(result_future2);
-    cass_future_free(result_future3);
-
-    if (result_future4) {
-        cass_future_free(result_future4);
-    }
+    spool->wait_all();
+    int errors = spool->get_errors();
+    delete spool;
     
-    if (error) {
+    if (errors > 0) {
         return -EIO;
     }
     
