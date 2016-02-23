@@ -12,8 +12,11 @@
 #include <list>
 #include <stdio.h>
 #include <cassandra.h>
+#include <mutex>
 
-class CassandraFutureSpool {
+#include "Cache.h"
+
+class CassandraFutureSpool : public Cache {
 public:
     CassandraFutureSpool();
     ~CassandraFutureSpool();
@@ -29,6 +32,7 @@ private:
 
     std::list<CassFuture*> pending_futures;
     std::list<CassFuture*> done_futures;
+    std::mutex spool_mutex;
     int errors;
 };
 

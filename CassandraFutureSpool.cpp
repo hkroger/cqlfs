@@ -16,11 +16,14 @@ CassandraFutureSpool::~CassandraFutureSpool() {
 }
 
 void CassandraFutureSpool::append(CassFuture* future) {
+    std::lock_guard<std::mutex> lock(spool_mutex);
+
     wait_for_pending_futures();
     pending_futures.push_back(future);
 }
 
 void CassandraFutureSpool::wait_for_pending_futures() {
+    std::lock_guard<std::mutex> lock(spool_mutex);
     while (pending_futures.size() > MAX_PENDING_FUTURES) {
         check_pending_futures();
         
@@ -36,12 +39,16 @@ int CassandraFutureSpool::get_errors() {
 
 
 void CassandraFutureSpool::free_futures() {
+    std::lock_guard<std::mutex> lock(spool_mutex);
+
     for (std::list<CassFuture*>::iterator it=pending_futures.begin(); it != pending_futures.end(); ++it) {
         cass_future_free(*it);
     }
+    pending_futures.clear();
     for (std::list<CassFuture*>::iterator it=done_futures.begin(); it != done_futures.end(); ++it) {
         cass_future_free(*it);
     }
+    done_futures.clear();
 }
 
 void CassandraFutureSpool::check_pending_futures() {
@@ -61,6 +68,8 @@ void CassandraFutureSpool::check_pending_futures() {
 }
 
 void CassandraFutureSpool::wait_all() {
+    std::lock_guard<std::mutex> lock(spool_mutex);
+
     for (std::list<CassFuture*>::iterator it=pending_futures.begin(); it != pending_futures.end();) {
         if (cass_future_error_code(*it) != CASS_OK) {
             cassandra_log_error(*it);
