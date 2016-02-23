@@ -28,11 +28,10 @@ These are in no particular order.
 * Add performance tests
 * Test mounting from several places and see how that works.
 * Configuration options for keyspace name, hosts, etc.
-* Support stats
+* Support stats (disk used, disk free, etc.)
 * File handle support
 * Error handling
 * CQL consistency handling
-* Delete blocks when truncating
 * Speedup writes
 	* Support write caching
 	* Make writes even more asynchronous
