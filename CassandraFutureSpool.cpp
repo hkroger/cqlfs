@@ -23,7 +23,6 @@ void CassandraFutureSpool::append(CassFuture* future) {
 }
 
 void CassandraFutureSpool::wait_for_pending_futures() {
-    std::lock_guard<std::mutex> lock(spool_mutex);
     while (pending_futures.size() > MAX_PENDING_FUTURES) {
         check_pending_futures();
         
