@@ -324,7 +324,7 @@ int CassandraFS::truncate(const char* path, off_t size) {
     CassStatement* statement = NULL;
     struct stat stat;
     struct cfs_attrs cfs_attrs;
-    CassandraFutureSpool* spool = new CassandraFutureSpool();
+    CassandraFutureSpool* spool = new CassandraFutureSpool(4);
     
     int err = getattr(path, &stat, &cfs_attrs);
 
@@ -620,7 +620,7 @@ int CassandraFS::unlink(const char* path) {
         return attr_err;
     }
     
-    CassandraFutureSpool *spool = new CassandraFutureSpool();
+    CassandraFutureSpool *spool = new CassandraFutureSpool(4);
 
     spool->append(remove_entry(path));
     spool->append(remove_sub_entry(path));

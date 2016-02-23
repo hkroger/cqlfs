@@ -1,13 +1,12 @@
 #include "CassandraFutureSpool.h"
 #include "cqlfs_common.h"
 
-#define MAX_PENDING_FUTURES 64
-
 // In microseconds
-#define SLEEP_BETWEEN_CHECKS 50
+#define SLEEP_BETWEEN_CHECKS 1000
 
-CassandraFutureSpool::CassandraFutureSpool() {
+CassandraFutureSpool::CassandraFutureSpool(int max_pending_futures) {
     errors = 0;
+    this->max_pending_futures = max_pending_futures;
 }
 
 CassandraFutureSpool::~CassandraFutureSpool() {
@@ -23,10 +22,10 @@ void CassandraFutureSpool::append(CassFuture* future) {
 }
 
 void CassandraFutureSpool::wait_for_pending_futures() {
-    while (pending_futures.size() > MAX_PENDING_FUTURES) {
+    while (pending_futures.size() > max_pending_futures) {
         check_pending_futures();
         
-        if (pending_futures.size() > MAX_PENDING_FUTURES) {
+        if (pending_futures.size() > max_pending_futures) {
             usleep(SLEEP_BETWEEN_CHECKS);
         }
     }

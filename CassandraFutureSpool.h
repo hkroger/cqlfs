@@ -18,7 +18,7 @@
 
 class CassandraFutureSpool : public Cache {
 public:
-    CassandraFutureSpool();
+    CassandraFutureSpool(int max_pending_futures);
     ~CassandraFutureSpool();
     
     void append(CassFuture* future);
@@ -34,6 +34,7 @@ private:
     std::list<CassFuture*> done_futures;
     std::mutex spool_mutex;
     int errors;
+    int max_pending_futures;
 };
 
 #endif /* CassandraFutureSpool_hpp */
